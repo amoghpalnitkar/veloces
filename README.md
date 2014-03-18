@@ -6,14 +6,17 @@ The veloces I/O scheduler is a scheduler that does basic merging and read prefer
 Its main uses include efficient scheduling for non rotational solid state devices.
 
 Applying patch : 
-	linux-source $ : patch -p1 < pathtopatch/veloces
+	
+	patch -p1 < pathtopatch/veloces
 
 Compile linux kernel.
 
 Selecting the scheduler : 
+	
 	cat /sys/block/sdX/queue/scheduler
-	If the patch has been applied and kernel has been compiled correctly, then this command would show 'veloces' in the scheduler list. 
-	*sdX - select the appropriate device for which scheduler is to be selected
+
+		If the patch has been applied and kernel has been compiled correctly, then this command would show 'veloces' in the scheduler list. 
+		*sdX - select the appropriate device for which scheduler is to be selected
 
 	echo veloces > /sys/block/sdX/queue/scheduler
 
