@@ -1,0 +1,396 @@
+diff -uprN -X linux-3.12.4/Documentation/dontdiff linux-3.12.4/block/Kconfig.iosched Desktop/linux-3.12.4/ssd-scheduler/block/Kconfig.iosched
+--- linux-3.12.4/block/Kconfig.iosched	2013-12-08 21:48:58.000000000 +0530
++++ Desktop/linux-3.12.4/ssd-scheduler/block/Kconfig.iosched	2014-03-04 13:20:55.197305782 +0530
+@@ -12,6 +12,17 @@ config IOSCHED_NOOP
+ 	  that do their own scheduling and require only minimal assistance from
+ 	  the kernel.
+ 
++
++
++config IOSCHED_VELOCES
++	bool
++	default y
++	---help---
++	  The veloces I/O scheduler is a scheduler that does basic merging
++          and read preference. It peforms bundling of writes according to block boundary.
++          Its main uses include efficient scheduling for non rotational solid state devices.
++
++
+ config IOSCHED_DEADLINE
+ 	tristate "Deadline I/O scheduler"
+ 	default y
+diff -uprN -X linux-3.12.4/Documentation/dontdiff linux-3.12.4/block/Makefile Desktop/linux-3.12.4/ssd-scheduler/block/Makefile
+--- linux-3.12.4/block/Makefile	2013-12-08 21:48:58.000000000 +0530
++++ Desktop/linux-3.12.4/ssd-scheduler/block/Makefile	2014-03-04 13:21:27.257464760 +0530
+@@ -13,6 +13,7 @@ obj-$(CONFIG_BLK_DEV_BSGLIB)	+= bsg-lib.
+ obj-$(CONFIG_BLK_CGROUP)	+= blk-cgroup.o
+ obj-$(CONFIG_BLK_DEV_THROTTLING)	+= blk-throttle.o
+ obj-$(CONFIG_IOSCHED_NOOP)	+= noop-iosched.o
++obj-$(CONFIG_IOSCHED_VELOCES)+= veloces-iosched.o
+ obj-$(CONFIG_IOSCHED_DEADLINE)	+= deadline-iosched.o
+ obj-$(CONFIG_IOSCHED_CFQ)	+= cfq-iosched.o
+ 
+diff -uprN -X linux-3.12.4/Documentation/dontdiff linux-3.12.4/block/veloces-iosched.c Desktop/linux-3.12.4/ssd-scheduler/block/veloces-iosched.c
+--- linux-3.12.4/block/veloces-iosched.c	1970-01-01 05:30:00.000000000 +0530
++++ Desktop/linux-3.12.4/ssd-scheduler/block/veloces-iosched.c	2014-03-18 16:46:20.742158570 +0530
+@@ -0,0 +1,360 @@
++/*
++ * elevator veloces
++ * Read Preference implemented
++ * Front merging of requests
++ * Bundling of write requests
++ */
++#include <linux/blkdev.h>
++#include <linux/elevator.h>
++#include <linux/bio.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/init.h>
++#include "blk.h"
++
++
++#define rq_hash_key(rq)		(rq->bio->bi_sector)
++
++struct veloces_data {
++	struct list_head queue;
++	unsigned int write_expire;
++	int front_merges;
++	int max_count;
++};
++
++static struct veloces_data *wd;
++static const unsigned int write_expire = 0.5 * HZ;
++static const unsigned int max_count=8;
++
++static bool check_write(struct request *rq)
++{
++  	if(rq->bio->bi_rw & REQ_WRITE){
++      		return true;
++	}
++
++ 	return false;
++    
++}
++
++static inline void __elv_rqhash_del(struct request *rq)
++{
++	hash_del(&rq->hash);
++}
++
++
++static struct request *rqhash_find(struct request_queue *q, sector_t offset)
++{
++	/*
++		Find mergeable request
++	*/
++	struct elevator_queue *e = q->elevator;
++	struct hlist_node *next;
++	struct request *rq;
++
++	hash_for_each_possible_safe(e->hash, rq, next, hash, offset) {
++		BUG_ON(!ELV_ON_HASH(rq));
++
++		if (unlikely(!rq_mergeable(rq))) {
++			__elv_rqhash_del(rq);
++			continue;
++		}
++
++		if (rq_hash_key(rq) == offset)  {
++			return rq;
++		}
++	}
++
++	return NULL;
++}
++
++
++static int
++veloces_merge(struct request_queue *q, struct request **req, struct bio *bio)
++{
++	struct veloces_data *nd = q->elevator->elevator_data;
++	struct request *__rq;
++	int ret;
++
++	/*
++	 * check for front merge
++	 */
++	if (nd->front_merges) {
++		sector_t sector = bio_end_sector(bio);
++
++		__rq = rqhash_find(q, sector);
++		if (__rq) {
++			BUG_ON(sector != blk_rq_pos(__rq));
++
++			if (elv_rq_merge_ok(__rq, bio)) {
++				ret = ELEVATOR_FRONT_MERGE;
++				goto out;
++			}
++		}
++	}
++
++	return ELEVATOR_NO_MERGE;
++out:
++	*req = __rq;
++	return ret;
++}
++
++static void
++veloces_merged_requests(struct request_queue *q, struct request *req,
++			 struct request *next)
++{
++	/*
++	 * if next expires before rq, assign its expire time to rq
++	 * and move into next position (next will be deleted) in fifo
++	 */
++	if (!list_empty(&req->queuelist) && !list_empty(&next->queuelist)) {
++		if (time_before(rq_fifo_time(next), rq_fifo_time(req))) {
++			list_move(&req->queuelist, &next->queuelist);
++			rq_set_fifo_time(req, rq_fifo_time(next));
++		}
++	}
++
++	/*
++	 * kill knowledge of next, this one is a goner
++	 */
++	list_del_init(&next->queuelist);
++}
++
++static int check_for_buddy(struct request *current_rq,struct request *rq)
++{
++	/*
++	 *	check if request is buddy of current request
++	 */
++	unsigned long long int block,start_block,end_block;
++	block = blk_rq_pos(rq) >> 19;
++	start_block = block << 19;
++	end_block = start_block + 1048576;
++	if(start_block <= blk_rq_pos(current_rq) && blk_rq_pos(current_rq) < end_block)
++		return 1;
++	else
++		return 0;		
++	
++}
++
++static int veloces_dispatch(struct request_queue *q, int force)
++{
++	struct veloces_data *nd = q->elevator->elevator_data;
++	int count;
++	count = 0;
++	if(!list_empty(&wd->queue)){
++		struct request *write_rq,*rq;
++		write_rq=list_entry(wd->queue.next, struct request, queuelist);
++		if(time_after_eq(jiffies,rq_fifo_time(write_rq)) || list_empty(&nd->queue)){
++			/*
++			 *  if deadline is expired, find buddies and send bundle 
++			 */
++			do{
++				write_rq=list_entry(wd->queue.next, struct request, queuelist);
++				list_del_init(&write_rq->queuelist);
++				elv_dispatch_sort(q,write_rq);
++				rq = list_entry(wd->queue.next,struct request,queuelist);		
++				count++;
++			}while(!list_empty(&wd->queue) && count < nd->max_count && check_for_buddy(rq,write_rq));
++			count = 0;	
++			return 1;
++		}
++		
++	}
++		
++	if (!list_empty(&nd->queue)) {
++		/*
++		 *       send read requests as they come
++		 */
++		struct request *rq;
++		rq = list_entry(nd->queue.next, struct request, queuelist);
++		list_del_init(&rq->queuelist);
++		elv_dispatch_sort(q, rq);
++		return 1;
++
++	}
++
++
++	return 0;
++}
++
++static void veloces_add_request(struct request_queue *q, struct request *rq)
++{
++	struct veloces_data *nd = q->elevator->elevator_data;
++	
++	/*
++	 *	classify the requests into read and write queues
++	 */
++	if(check_write(rq)){
++		list_add_tail(&rq->queuelist, &wd->queue);
++		rq_set_fifo_time(rq, jiffies + nd->write_expire);
++	}
++	else{
++
++		list_add_tail(&rq->queuelist, &nd->queue);
++		rq_set_fifo_time(rq, jiffies + nd->write_expire);
++	}
++}
++
++static struct request *
++veloces_former_request(struct request_queue *q, struct request *rq)
++{
++	struct veloces_data *nd = q->elevator->elevator_data;
++
++	if (rq->queuelist.prev == &nd->queue)
++		return NULL;
++	return list_entry(rq->queuelist.prev, struct request, queuelist);
++}
++
++static struct request *
++veloces_latter_request(struct request_queue *q, struct request *rq)
++{
++	struct veloces_data *nd = q->elevator->elevator_data;
++
++	if (rq->queuelist.next == &nd->queue)
++		return NULL;
++	return list_entry(rq->queuelist.next, struct request, queuelist);
++}
++
++static int veloces_init_queue(struct request_queue *q, struct elevator_type *e)
++{
++	struct veloces_data *nd;
++	struct elevator_queue *eq;
++
++	eq = elevator_alloc(q, e);
++	if (!eq)
++		return -ENOMEM;
++
++	nd = kmalloc_node(sizeof(*nd), GFP_KERNEL, q->node);
++	if (!nd) {
++		kobject_put(&eq->kobj);
++		return -ENOMEM;
++	}
++	eq->elevator_data = nd;
++
++
++	wd = kmalloc_node(sizeof(*wd), GFP_KERNEL, q->node);
++	if (!wd) {
++		kobject_put(&eq->kobj);
++		return -ENOMEM;
++	}
++		
++
++	INIT_LIST_HEAD(&nd->queue);
++	INIT_LIST_HEAD(&wd->queue);
++	
++	nd->front_merges=1;
++	nd->write_expire=write_expire;
++	nd->max_count=max_count;
++	spin_lock_irq(q->queue_lock);
++	q->elevator = eq;
++	spin_unlock_irq(q->queue_lock);
++	return 0;
++}
++
++static void veloces_exit_queue(struct elevator_queue *e)
++{
++	struct veloces_data *nd = e->elevator_data;
++
++	BUG_ON(!list_empty(&nd->queue));
++	kfree(nd);
++	kfree(wd);
++}
++
++/*
++ *      For tunables
++ */
++
++static ssize_t
++veloces_var_show(int var, char *page)
++{
++	return sprintf(page, "%d\n", var);
++}
++
++static ssize_t
++veloces_var_store(int *var, const char *page, size_t count)
++{
++	char *p = (char *) page;
++
++	*var = simple_strtol(p, &p, 10);
++	return count;
++}
++
++#define SHOW_FUNCTION(__FUNC, __VAR, __CONV)				\
++static ssize_t __FUNC(struct elevator_queue *e, char *page)		\
++{									\
++	struct veloces_data *nd = e->elevator_data;			\
++	int __data = __VAR;						\
++	if (__CONV)							\
++		__data = jiffies_to_msecs(__data);			\
++	return veloces_var_show(__data, (page));			\
++}
++
++SHOW_FUNCTION(veloces_write_expire_show, nd->write_expire, 1);
++SHOW_FUNCTION(veloces_max_count_show, nd->max_count, 0);
++#undef SHOW_FUNCTION
++
++#define STORE_FUNCTION(__FUNC, __PTR, MIN, MAX, __CONV)			\
++static ssize_t __FUNC(struct elevator_queue *e, const char *page, size_t count)	\
++{									\
++	struct veloces_data *nd = e->elevator_data;			\
++	int __data;							\
++	int ret = veloces_var_store(&__data, (page), count);		\
++	if (__data < (MIN))						\
++		__data = (MIN);						\
++	else if (__data > (MAX))					\
++		__data = (MAX);						\
++	if (__CONV)							\
++		*(__PTR) = msecs_to_jiffies(__data);			\
++	else								\
++		*(__PTR) = __data;					\
++	return ret;							\
++}
++STORE_FUNCTION(veloces_write_expire_store, &nd->write_expire, 0, INT_MAX, 1);
++STORE_FUNCTION(veloces_max_count_store, &nd->max_count, 0, INT_MAX, 0);
++
++#undef STORE_FUNCTION
++
++#define RM_ATTR(name) \
++	__ATTR(name, S_IRUGO|S_IWUSR, veloces_##name##_show, \
++				      veloces_##name##_store)
++
++static struct elv_fs_entry veloces_attrs[] = {
++	RM_ATTR(write_expire),
++	RM_ATTR(max_count),
++	__ATTR_NULL
++};
++
++
++
++static struct elevator_type elevator_veloces = {
++	.ops = {
++		.elevator_merge_fn 		= veloces_merge,
++		.elevator_merge_req_fn		= veloces_merged_requests,
++		.elevator_dispatch_fn		= veloces_dispatch,
++		.elevator_add_req_fn		= veloces_add_request,
++		.elevator_former_req_fn		= veloces_former_request,
++		.elevator_latter_req_fn		= veloces_latter_request,
++		.elevator_init_fn		= veloces_init_queue,
++		.elevator_exit_fn		= veloces_exit_queue,
++	},
++	.elevator_attrs = veloces_attrs,
++	.elevator_name = "veloces",
++	.elevator_owner = THIS_MODULE,
++};
++
++static int __init veloces_init(void)
++{
++	return elv_register(&elevator_veloces);
++}
++
++static void __exit veloces_exit(void)
++{
++	elv_unregister(&elevator_veloces);
++}
++
++module_init(veloces_init);
++module_exit(veloces_exit);
++
++
++MODULE_AUTHOR("Deep Thought");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("Veloces IO scheduler");
